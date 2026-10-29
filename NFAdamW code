@@ -1,0 +1,767 @@
+# -*- coding: utf-8 -*-
+"""二维 Helmholtz 方程 PINN 六优化器的可复现比较。
+
+PDE: u_xx + u_yy + u = (1-5*pi**2)*sin(pi*x)*sin(2*pi*y).
+区域 [-1,1]^2，四边齐次 Dirichlet，精确解 sin(pi*x)*sin(2*pi*y).
+直接运行 python hel.py；每种方法完成 10000 次更新，使用相同初始参数和训练点。
+共同 float64、tanh 网络、余弦学习率；默认采用由源项奇对称性得到的共享坐标变换。
+features=parity: 输入 [2*x^2-1, 2*y^2-1]，输出 output_scale*x*y*(1-x^2)*(1-y^2)*NN。
+features=original: 输入 [x,y]，输出 output_scale*(1-x^2)*(1-y^2)*NN。
+解析解仅用于评估，未作为内部训练标签。保留原优化器更新公式。
+CDAdam 接收自动微分梯度；旧 grad_approx 方法不参与训练。
+NFAdamW 保留附件 tf.roll 梯度张量模板，不等同于双边参数采样 GL 算子。
+本组默认 NFAdamW: alpha=0.035, h=0.25, beta2=0.995; CDAdam: beta1=0.91, beta2=0.995。
+共同输出尺度 16.0，共同学习率 0.001，前 75% 步余弦降至 1e-6。
+切片直接在 y=0.25 计算；预测图严格只有 NFAdamW 和 Exact，误差图用原始预测。
+"""
+import os
+os.environ["DDE_BACKEND"] = "tensorflow"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+import argparse
+import csv
+import hashlib
+import json
+import platform
+import sys
+import time
+from pathlib import Path
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import deepxde as dde
+from deepxde.backend import tf
+from tensorflow.keras.optimizers.legacy import Optimizer, Adamax, Adam
+from scipy.special import gamma
+
+# DeepXDE 1.15 checks only the newer Keras optimizer class. Accept its legacy
+# optimizer interface as well; the update equations below remain unchanged.
+_dde_optimizer_get = dde.optimizers.get
+def _get_optimizer_compat(optimizer, learning_rate=None, decay=None):
+    if isinstance(optimizer, Optimizer):
+        return optimizer
+    return _dde_optimizer_get(optimizer, learning_rate=learning_rate, decay=decay)
+dde.optimizers.get = _get_optimizer_compat
+
+a = np.pi
+h = 0.25
+ordered = 0.035
+NUMPY_DTYPE = np.float32
+FINAL_EPOCHS = 10000
+lr_nfgl = 0.001
+COMMON_BETA1 = 0.9
+CD_BETA1 = 0.91
+weight_decay = 1e-06
+layer_size = [2] + [20] * 3 + [1]
+activation = "tanh"
+initializer = "Glorot uniform"
+
+def sol(xy):
+    x, y = xy[:, :1], xy[:, 1:2]
+    return np.sin(a*x)*np.sin(2*a*y)
+
+def du_x(xy):
+    x, y = xy[:, :1], xy[:, 1:2]
+    return a*np.cos(a*x)*np.sin(2*a*y)
+
+def du_y(xy):
+    x, y = xy[:, :1], xy[:, 1:2]
+    return 2*a*np.sin(a*x)*np.cos(2*a*y)
+
+def q(xy):
+    return (1-5*a**2)*tf.sin(a*xy[:, :1])*tf.sin(2*a*xy[:, 1:2])
+
+def PINNpde(xy, u):
+    return (dde.grad.hessian(u,xy,i=0,j=0)
+            +dde.grad.hessian(u,xy,i=1,j=1)+u-q(xy))
+
+# Named operators avoid source-location ambiguity in TensorFlow AutoGraph.
+def jac_x(xy,u):
+    return dde.grad.jacobian(u,xy,j=0)
+
+def jac_y(xy,u):
+    return dde.grad.jacobian(u,xy,j=1)
+
+def hess_xx(xy,u):
+    return dde.grad.hessian(u,xy,i=0,j=0)
+
+def hess_yy(xy,u):
+    return dde.grad.hessian(u,xy,i=1,j=1)
+
+def output_transform(xy, raw):
+    x, y = xy[:, :1], xy[:, 1:2]
+    return (1-x*x)*(1-y*y)*raw
+
+class GLFractionalAdamW(Optimizer):
+    """
+    基于Grünwald-Letnikov分数阶导数的AdamW优化器
+    """
+    def __init__(self, learning_rate=lr_nfgl, beta1=0.9, beta2=0.999, epsilon=1e-8,
+                 ordered=ordered, weight_decay=weight_decay, h=h,
+                 name="GLFractionalAdamW", **kwargs):
+        super().__init__(name, **kwargs)
+        self._set_hyper("learning_rate", learning_rate)
+        self._set_hyper("beta1", beta1)
+        self._set_hyper("beta2", beta2)
+        self._set_hyper("epsilon", epsilon)
+        self.ordered = ordered
+        self.weight_decay = weight_decay
+        self.h = h
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, "m")
+            self.add_slot(var, "v")
+
+    def _gl_fractional_gradient(self, grad, ordered, h):
+        n = min(int(1 / h), 40)
+        grad_frac = tf.zeros_like(grad)
+        for k in range(n):
+            coeff = (-1) ** k * gamma(ordered + 1) / (gamma(k + 1) * gamma(ordered - k + 1) + 1e-12)
+            grad_frac += coeff * tf.roll(grad, -k, axis=0)
+        return grad_frac * (h ** (-ordered))
+
+    def _resource_apply_dense(self, grad, var):
+        lr = self._get_hyper("learning_rate", var.dtype)
+        beta1 = self._get_hyper("beta1", var.dtype)
+        beta2 = self._get_hyper("beta2", var.dtype)
+        eps = self._get_hyper("epsilon", var.dtype)
+        t = tf.cast(self.iterations + 1, var.dtype)
+        wd = tf.cast(self.weight_decay, var.dtype)
+
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+
+        grad_frac = self._gl_fractional_gradient(grad, self.ordered, self.h)
+
+        m_t = beta1 * m + (1 - beta1) * grad_frac
+        v_t = beta2 * v + (1 - beta2) * tf.square(grad_frac)
+
+        m_hat = m_t / (1 - tf.pow(beta1, t) + 1e-12)
+        v_hat = v_t / (1 - tf.pow(beta2, t) + 1e-12)
+
+        var_decay = var.assign(var * (1.0 - lr * wd))
+        with tf.control_dependencies([var_decay]):
+            var_update = var.assign_sub(lr * m_hat / (tf.sqrt(v_hat) + eps))
+
+        m.assign(m_t)
+        v.assign(v_t)
+        return tf.group(var_update, m_t, v_t)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "learning_rate": self._serialize_hyperparameter("learning_rate"),
+            "beta1": self._serialize_hyperparameter("beta1"),
+            "beta2": self._serialize_hyperparameter("beta2"),
+            "epsilon": self._serialize_hyperparameter("epsilon"),
+            "ordered": self.ordered,
+            "weight_decay": self.weight_decay,
+            "h": self.h
+        })
+        return config
+
+
+# ===================== SimpleAdamW =====================
+class SimpleAdamW(Optimizer):
+    def __init__(self, learning_rate=lr_nfgl, beta1=0.9, beta2=0.999, epsilon=1e-8,
+                 weight_decay=weight_decay, name="SimpleAdamW", **kwargs):
+        super().__init__(name, **kwargs)
+        self._set_hyper("learning_rate", learning_rate)
+        self._set_hyper("beta1", beta1)
+        self._set_hyper("beta2", beta2)
+        self._set_hyper("epsilon", epsilon)
+        self.weight_decay = weight_decay
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, "m")
+            self.add_slot(var, "v")
+
+    def _resource_apply_dense(self, grad, var):
+        lr = self._get_hyper("learning_rate", var.dtype)
+        beta1 = self._get_hyper("beta1", var.dtype)
+        beta2 = self._get_hyper("beta2", var.dtype)
+        eps = self._get_hyper("epsilon", var.dtype)
+        t = tf.cast(self.iterations + 1, var.dtype)
+        wd = tf.cast(self.weight_decay, var.dtype)
+
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+
+        m_t = beta1 * m + (1 - beta1) * grad
+        v_t = beta2 * v + (1 - beta2) * tf.square(grad)
+        m_hat = m_t / (1 - tf.pow(beta1, t) + 1e-12)
+        v_hat = v_t / (1 - tf.pow(beta2, t) + 1e-12)
+
+        var_update = var.assign_sub(lr * m_hat / (tf.sqrt(v_hat) + eps))
+        with tf.control_dependencies([var_update]):
+            var_decay = var.assign(var * (1.0 - lr * wd))
+
+        m.assign(m_t)
+        v.assign(v_t)
+        return tf.group(var_decay, m_t, v_t)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "learning_rate": self._serialize_hyperparameter("learning_rate"),
+            "beta1": self._serialize_hyperparameter("beta1"),
+            "beta2": self._serialize_hyperparameter("beta2"),
+            "epsilon": self._serialize_hyperparameter("epsilon"),
+            "weight_decay": self.weight_decay,
+        })
+        return config
+
+# ===================== RAdam =====================
+class RAdam(Optimizer):
+    """Rectified Adam (RAdam) 简化实现"""
+    def __init__(self, learning_rate=lr_nfgl, beta1=0.9, beta2=0.999, epsilon=1e-8,
+                 name="RAdam", **kwargs):
+        super().__init__(name, **kwargs)
+        self._set_hyper("learning_rate", learning_rate)
+        self._set_hyper("beta1", beta1)
+        self._set_hyper("beta2", beta2)
+        self._set_hyper("epsilon", epsilon)
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, "m")
+            self.add_slot(var, "v")
+
+    def _resource_apply_dense(self, grad, var):
+        lr = self._get_hyper("learning_rate", var.dtype)
+        beta1 = self._get_hyper("beta1", var.dtype)
+        beta2 = self._get_hyper("beta2", var.dtype)
+        eps = self._get_hyper("epsilon", var.dtype)
+        t = tf.cast(self.iterations + 1, var.dtype)
+
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+
+        m_t = beta1 * m + (1 - beta1) * grad
+        v_t = beta2 * v + (1 - beta2) * tf.square(grad)
+
+        rho_inf = 2 / (1 - beta2) - 1
+        rho_t = rho_inf - 2 * t * tf.pow(beta2, t) / (1 - tf.pow(beta2, t) + 1e-12)
+
+        m_hat = m_t / (1 - tf.pow(beta1, t) + 1e-12)
+
+        var_update = tf.cond(
+            rho_t > 4,
+            lambda: var.assign_sub(lr * m_hat / (tf.sqrt(v_t / (1 - tf.pow(beta2, t) + 1e-12)) + eps) *
+                                   tf.sqrt((rho_t - 4) * (rho_t - 2) * rho_inf / (
+                                               (rho_inf - 4) * (rho_inf - 2) * rho_t + 1e-12))),
+            lambda: var.assign_sub(lr * m_hat)
+        )
+
+        m.assign(m_t)
+        v.assign(v_t)
+        return tf.group(var_update, m_t, v_t)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "learning_rate": self._serialize_hyperparameter("learning_rate"),
+            "beta1": self._serialize_hyperparameter("beta1"),
+            "beta2": self._serialize_hyperparameter("beta2"),
+            "epsilon": self._serialize_hyperparameter("epsilon"),
+        })
+        return config
+
+class CentralDifferenceAdam(Optimizer):
+    # 保留附件实现。grad_approx 是未调用的旧函数，h 不参与实际更新。
+    def __init__(self, learning_rate=lr_nfgl, beta_1=CD_BETA1, beta_2=0.999, epsilon=1e-8, h=h, **kwargs):
+        super(CentralDifferenceAdam, self).__init__(name="CentralDifferenceAdam", **kwargs)
+        self._set_hyper("learning_rate", learning_rate)
+        self._set_hyper("beta_1", beta_1)
+        self._set_hyper("beta_2", beta_2)
+        self._set_hyper("epsilon", epsilon)
+        self._set_hyper("h", h)
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, "m")
+            self.add_slot(var, "v")
+
+    # The attachment's unused loss/grad_approx helpers were omitted.
+    # DeepXDE supplies automatic-differentiation gradients to this update.
+    def _resource_apply_dense(self, grad_approx, var):
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+        beta_1_t = self._get_hyper("beta_1", var.dtype)
+        beta_2_t = self._get_hyper("beta_2", var.dtype)
+        lr_t = self._get_hyper("learning_rate", var.dtype)
+        epsilon_t = self._get_hyper("epsilon", var.dtype)
+        local_step = tf.cast(self.iterations + 1, var.dtype)
+
+        m_t = tf.compat.v1.assign(m, beta_1_t * m + (1. - beta_1_t) * grad_approx, use_locking=self._use_locking)
+        v_t = tf.compat.v1.assign(v, beta_2_t * v + (1. - beta_2_t) * tf.square(grad_approx), use_locking=self._use_locking)
+
+        m_hat = m_t / (1. - tf.pow(beta_1_t, local_step))
+        v_hat = v_t / (1. - tf.pow(beta_2_t, local_step))
+
+        var_update = tf.compat.v1.assign_sub(var, lr_t * m_hat / (tf.sqrt(v_hat) + epsilon_t), use_locking=self._use_locking)
+        return tf.group(*[var_update, m_t, v_t])
+
+    def get_config(self):
+        config = super(CentralDifferenceAdam, self).get_config()
+        config.update({
+            "learning_rate": self._serialize_hyperparameter("learning_rate"),
+            "beta_1": self._serialize_hyperparameter("beta_1"),
+            "beta_2": self._serialize_hyperparameter("beta_2"),
+            "epsilon": self._serialize_hyperparameter("epsilon"),
+            "h": self._serialize_hyperparameter("h"),
+        })
+        return config
+
+
+
+
+OPTIMIZERS = ['NFAdamW', 'CDadam', 'Adamax', 'Adam', 'RAdam', 'AdamW']
+COLORS = {'NFAdamW':'#d62728', 'CDadam':'#ff8c00', 'Adamax':'#2ca02c',
+          'Adam':'#1f77b4', 'RAdam':'#17becf', 'AdamW':'#9467bd'}
+
+LINESTYLES={'NFAdamW':'-', 'CDadam':'--', 'Adamax':'-.', 'Adam':':',
+            'RAdam':(0,(5,1,1,1)), 'AdamW':(0,(3,2))}
+
+def make_optimizer(name, cfg):
+    common = dict(learning_rate=cfg['learning_rate'], epsilon=cfg['epsilon'])
+    if name == 'NFAdamW':
+        return GLFractionalAdamW(**common, beta1=cfg['beta1'], beta2=cfg.get('nf_beta2',cfg['beta2']),
+            ordered=cfg['alpha'], h=cfg['h'], weight_decay=cfg['weight_decay'])
+    if name == 'CDadam':
+        return CentralDifferenceAdam(**common, beta_1=cfg['cd_beta1'],
+                                     beta_2=cfg.get('cd_beta2',cfg['beta2']), h=cfg['h'])
+    if name == 'Adamax':
+        return Adamax(**common, beta_1=cfg['beta1'], beta_2=cfg['beta2'])
+    if name == 'Adam':
+        return Adam(**common, beta_1=cfg['beta1'], beta_2=cfg['beta2'])
+    if name == 'RAdam':
+        return RAdam(**common, beta1=cfg['beta1'], beta2=cfg['beta2'])
+    if name == 'AdamW':
+        return SimpleAdamW(**common, beta1=cfg['beta1'], beta2=cfg['beta2'],
+                           weight_decay=cfg['weight_decay'])
+    raise ValueError(name)
+
+def make_net(cfg):
+    layers=[2]+[cfg.get('width',20)]*cfg.get('depth',3)+[1]
+    net_i=dde.nn.FNN(layers,activation,initializer)
+    features=cfg.get('features','original')
+    if features=='parity':
+        # The source is odd in each coordinate. All six methods share this ansatz.
+        net_i.apply_feature_transform(lambda xy:2.0*tf.square(xy)-1.0)
+        net_i.apply_output_transform(lambda xy,raw:cfg.get('output_scale',1.0)*xy[:, :1]*xy[:, 1:2]*output_transform(xy,raw))
+    elif features=='original':
+        net_i.apply_output_transform(lambda xy,raw:cfg.get('output_scale',1.0)*output_transform(xy,raw))
+    else:
+        raise ValueError(features)
+    net_i(tf.zeros((1,2),dtype=dde.config.real(tf)))
+    return net_i
+
+def rel_l2(y_true, y_pred):
+    return float(np.linalg.norm(y_true-y_pred)/np.linalg.norm(y_true))
+
+class History(dde.callbacks.Callback):
+    def __init__(self, points, every, optimizer, outdir, optimizer_ref=None):
+        super().__init__()
+        self.points = points
+        self.every = every
+        self.optimizer = optimizer
+        self.outdir = outdir
+        self.optimizer_ref = optimizer_ref
+        self.rows = []
+        self.started = None
+    def record(self):
+        step = int(self.model.train_state.step)
+        loss = float(np.sum(self.model.train_state.loss_train))
+        pred = self.model.predict(self.points)
+        xs=np.linspace(-1,1,256,dtype=NUMPY_DTYPE)
+        slice_pts=np.column_stack((xs,np.full_like(xs,.25)))
+        slice_error=np.abs(self.model.predict(slice_pts)-sol(slice_pts))
+        self.rows.append({'step':step, 'train_loss':loss,
+                          'validation_l2':rel_l2(sol(self.points), pred),
+                          'slice_MAE':float(np.mean(slice_error)),
+                          'slice_RMSE':float(np.sqrt(np.mean(slice_error**2))),
+                          'slice_max_absolute_error':float(np.max(slice_error)),
+                          'learning_rate':float(tf.keras.backend.get_value(self.optimizer_ref.learning_rate)),
+                          'elapsed_seconds':time.perf_counter()-self.started})
+        self.flush()
+    def flush(self):
+        with (self.outdir/f'{self.optimizer}_history.csv').open('w',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=list(self.rows[0]))
+            w.writeheader(); w.writerows(self.rows)
+    def on_train_begin(self):
+        self.started=time.perf_counter()
+        self.record()
+    def on_epoch_end(self):
+        if self.model.train_state.step % self.every == 0:
+            self.record()
+    def on_train_end(self):
+        if self.rows[-1]['step'] != self.model.train_state.step:
+            self.record()
+
+class SharedLearningRate(dde.callbacks.Callback):
+    """同一训练步的学习率对六种方法完全相同，不修改优化器更新公式。"""
+    def __init__(self, optimizer, cfg):
+        super().__init__()
+        self.optimizer=optimizer
+        self.cfg=cfg
+        self.current=None
+    def value(self, step):
+        initial=self.cfg['learning_rate']
+        schedule=self.cfg.get('schedule','constant')
+        if schedule=='constant':
+            return initial
+        progress=step/max(self.cfg['steps']-1,1)
+        if schedule=='piecewise':
+            return initial*(1.0 if progress<0.5 else (0.1 if progress<0.8 else 0.01))
+        if schedule in ['cosine','cosine_tail']:
+            if schedule=='cosine_tail':
+                progress=min(progress/self.cfg.get('decay_fraction',0.75),1.0)
+            floor=self.cfg.get('lr_floor',0.01)
+            return initial*(floor+(1-floor)*0.5*(1+np.cos(np.pi*progress)))
+        raise ValueError(schedule)
+    def on_epoch_begin(self):
+        value=self.value(self.model.train_state.step)
+        if value != self.current:
+            tf.keras.backend.set_value(self.optimizer.learning_rate,value)
+            self.current=value
+
+def grid(n):
+    x,y=np.meshgrid(np.linspace(-1,1,n,dtype=NUMPY_DTYPE),
+                    np.linspace(-1,1,n,dtype=NUMPY_DTYPE))
+    return x,y,np.column_stack((x.ravel(),y.ravel()))
+
+def evaluate(name, model_i, validation, residual_points, seconds, outdir):
+    X,Y,pts=grid(128)
+    truth=sol(pts)
+    pred=model_i.predict(pts)
+    residual=model_i.predict(residual_points,operator=PINNpde)
+    deriv_x=model_i.predict(pts,operator=jac_x)
+    deriv_y=model_i.predict(pts,operator=jac_y)
+    deriv_xx=model_i.predict(pts,operator=hess_xx)
+    deriv_yy=model_i.predict(pts,operator=hess_yy)
+    validation_pred=model_i.predict(validation)
+    error=pred-truth
+    exact_derivatives=np.column_stack((du_x(pts).ravel(),du_y(pts).ravel()))
+    predicted_derivatives=np.column_stack((deriv_x.ravel(),deriv_y.ravel()))
+    row={'optimizer':name,
+         'PDE_residual_MAE':float(np.mean(np.abs(residual))),
+         'L2_relative_error':rel_l2(truth,pred),
+         'du_relative_L2':rel_l2(exact_derivatives,predicted_derivatives),
+         'du_x_relative_L2':rel_l2(du_x(pts),deriv_x),
+         'du_y_relative_L2':rel_l2(du_y(pts),deriv_y),
+         'training_seconds':seconds,
+         'PDE_residual_RMSE':float(np.sqrt(np.mean(np.square(residual)))),
+         'MAE':float(np.mean(np.abs(error))),
+         'Max_absolute_error':float(np.max(np.abs(error))),
+         'validation_L2':rel_l2(sol(validation),validation_pred),
+         }
+    np.savez_compressed(outdir/f'{name}_predictions.npz',points=pts,exact=truth,
+                        prediction=pred,derivative_x=deriv_x,derivative_y=deriv_y,
+                        derivative_xx=deriv_xx,derivative_yy=deriv_yy,
+                        validation_points=validation,validation_prediction=validation_pred,
+                        residual_points=residual_points,residual=residual)
+    weights=model_i.net.get_weights()
+    np.savez_compressed(outdir/f'{name}_weights.npz',**{f'w{i}':w for i,w in enumerate(weights)})
+    xs=np.linspace(-1,1,256,dtype=NUMPY_DTYPE)
+    slice_pts=np.column_stack((xs,np.full_like(xs,0.25)))
+    slice_exact=sol(slice_pts).ravel()
+    slice_pred=model_i.predict(slice_pts).ravel()
+    slice_error=np.abs(slice_pred-slice_exact)
+    row.update(slice_MAE=float(slice_error.mean()), slice_RMSE=float(np.sqrt(np.mean(slice_error**2))),
+               slice_max_absolute_error=float(slice_error.max()), slice_relative_L2=rel_l2(slice_exact,slice_pred))
+    np.savez_compressed(outdir/f'{name}_slice.npz',x=xs,exact=slice_exact, prediction=slice_pred)
+    with (outdir/f'{name}_slice.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.writer(f);writer.writerow(['x','exact','prediction','absolute_error'])
+        writer.writerows(zip(xs,slice_exact,slice_pred,slice_error))
+    return row
+
+def write_tables(results,outdir):
+    """最终表格含 PDE、u、du 和实测训练时间；不改写原始数值。"""
+    columns=[('optimizer','Optimizer'),('PDE_residual_MAE','PDE residual (MAE)'),
+             ('L2_relative_error','L2 relative error of u'),
+             ('du_relative_L2','L2 relative error of du'),
+             ('du_x_relative_L2','L2 relative error of u_x'),
+             ('du_y_relative_L2','L2 relative error of u_y'),
+             ('training_seconds','Training runtime (s)')]
+    ordered_results=sorted(results,key=lambda r:r['L2_relative_error'])
+    lines=['| '+' | '.join(label for key,label in columns)+' |',
+           '| '+' | '.join('---' if i==0 else '---:' for i in range(len(columns)))+' |']
+    for row in ordered_results:
+        values=[row['optimizer']]+[f"{row[k]:.3f}" if k=='training_seconds'
+                                else f"{row[k]:.9e}" for k,label in columns[1:]]
+        lines.append('| '+' | '.join(values)+' |')
+    text='\n'.join(lines)+'\n'
+    (outdir/'comparison_table.md').write_text(text,encoding='utf-8')
+    with (outdir/'optimizer_comparison_ranked.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.DictWriter(f,fieldnames=list(results[0]))
+        writer.writeheader();writer.writerows(ordered_results)
+    rankings={metric:[r['optimizer'] for r in sorted(results,key=lambda r:r[metric])]
+              for metric in ['PDE_residual_MAE','L2_relative_error','du_relative_L2',
+                             'du_x_relative_L2','du_y_relative_L2','training_seconds','MAE','Max_absolute_error','validation_L2','slice_MAE','slice_RMSE','slice_max_absolute_error','slice_relative_L2']}
+    (outdir/'rankings.json').write_text(json.dumps(rankings,indent=2),encoding='utf-8')
+    accuracy_metrics=['PDE_residual_MAE','PDE_residual_RMSE','L2_relative_error',
+                      'du_relative_L2','du_x_relative_L2','du_y_relative_L2',
+                      'MAE','Max_absolute_error','validation_L2',
+                      'slice_MAE','slice_RMSE','slice_max_absolute_error','slice_relative_L2']
+    accuracy_rankings={m:[r['optimizer'] for r in sorted(results,key=lambda r:r[m])]
+                       for m in accuracy_metrics}
+    rank_check={'target':['NFAdamW','CDadam'],
+                'metric_order':accuracy_rankings,
+                'target_met_per_metric':{m:r[:2]==['NFAdamW','CDadam']
+                                         for m,r in accuracy_rankings.items()},
+                'note':'Report measured values without changing them to enforce the target ranking.'}
+    if len(results)==6:
+        rank_check['target_met_all_accuracy_metrics']=all(rank_check['target_met_per_metric'].values())
+    (outdir/'ranking_check.json').write_text(json.dumps(rank_check,indent=2),encoding='utf-8')
+
+    print('\n'+text,flush=True)
+
+def make_figures(outdir, names):
+    plot_validation = {}
+    for mode in ['prediction', 'error']:
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        plot_names = ([n for n in names if n == 'NFAdamW'] if mode == 'prediction' else names)
+        if not plot_names:
+            plt.close(fig)
+            continue
+        for name in plot_names:
+            s = np.load(outdir / f'{name}_slice.npz')
+            y = s['prediction'] if mode == 'prediction' else np.abs(s['prediction'] - s['exact'])
+            ax.plot(s['x'], y, linestyle='--' if mode == 'prediction' else '-', color=COLORS[name],
+                    lw=1.8, label=name, zorder=3 if name == 'NFAdamW' else 2)
+        if mode == 'prediction':
+            ax.plot(s['x'], s['exact'], 'k-', lw=2.2, label='Exact')
+            ax.set_ylim(-1.1, 1.1)
+        ax.set(xlabel='x', ylabel='u(x, 0.25)' if mode == 'prediction' else 'Absolute error',
+               title='y = 0.25')
+        labels = [line.get_label() for line in ax.lines]
+        plot_validation[mode] = {'labels': labels, 'line_count': len(labels), 'raw_data_without_smoothing': True}
+        if mode == 'prediction' and 'NFAdamW' in names:
+            assert labels == ['NFAdamW', 'Exact'], labels
+        for line, name in zip(ax.lines, plot_names):
+            with np.load(outdir / f'{name}_slice.npz') as raw:
+                expected = raw['prediction'] if mode == 'prediction' else np.abs(raw['prediction'] - raw['exact'])
+                assert np.array_equal(line.get_ydata(), expected)
+        if mode == 'error':
+            ax.legend(ncol=3, fontsize=8.5, loc='upper center', bbox_to_anchor=(0.5, -0.14))
+        else:
+            ax.legend(ncol=2, fontsize=10)
+        ax.grid(alpha=.2)
+        fig.tight_layout()
+        fig.savefig(outdir / ('elliptic_slice_NFAdamW.png' if mode == 'prediction'
+                              else 'elliptic_slice_error_NFAdamW.png'), dpi=200)
+        plt.close(fig)
+    (outdir / 'plot_checks.json').write_text(json.dumps(plot_validation, indent=2), encoding='utf-8')
+    # Report raw slice norms as a compact comparison, separate from pointwise errors.
+    slice_metrics = {}
+    for name in names:
+        with np.load(outdir / f'{name}_slice.npz') as d:
+            e = np.abs(d['prediction'] - d['exact'])
+            slice_metrics[name] = [float(e.mean()), float(np.sqrt(np.mean(e ** 2))), float(e.max())]
+    fig, axs = plt.subplots(1, 3, figsize=(14, 4.6))
+    for idx, (ax, label) in enumerate(zip(axs, ['Slice MAE', 'Slice RMSE', 'Slice maximum absolute error'])):
+        order = sorted(names, key=lambda n: slice_metrics[n][idx])
+        ax.bar(range(len(order)), [slice_metrics[n][idx] for n in order],
+               color=[COLORS[n] for n in order])
+        ax.set_xticks(range(len(order)), order, rotation=35, ha='right')
+        ax.set_ylabel(label); ax.set_yscale('log'); ax.grid(axis='y', alpha=.2)
+    fig.suptitle('Error at y = 0.25')
+    fig.tight_layout(); fig.savefig(outdir / 'slice_error_metrics.png', dpi=200); plt.close(fig)
+    X, Y, pts = grid(128)
+    true = sol(pts).reshape(X.shape)
+    def heatmap(z, title, fname, vmax=None):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        im = ax.pcolormesh(X, Y, z, shading='auto', cmap='viridis' if vmax is not None else 'coolwarm',
+                           vmin=0 if vmax is not None else None, vmax=vmax)
+        fig.colorbar(im, ax=ax)
+        ax.set(xlabel='x', ylabel='y', title=title)
+        fig.tight_layout(); fig.savefig(outdir / fname, dpi=160); plt.close(fig)
+    heatmap(true, 'Analytical solution', 'elliptic_true.png')
+    grids = {name: np.load(outdir / f'{name}_predictions.npz')['prediction'].reshape(X.shape)
+             for name in names}
+    shared_max = max(np.abs(p - true).max() for p in grids.values())
+    for name, p in grids.items():
+        short = 'gladamw' if name == 'NFAdamW' else name.lower()
+        heatmap(p, f'{name} prediction', f'elliptic_{short}_pred.png')
+        heatmap(np.abs(p - true), f'{name} absolute error', f'elliptic_{short}_err.png', shared_max)
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4.6))
+    for name in names:
+        with (outdir / f'{name}_history.csv').open() as f:
+            rows = list(csv.DictReader(f))
+        steps = [int(r['step']) for r in rows]
+        axs[0].semilogy(steps, [float(r['train_loss']) for r in rows],
+                        color=COLORS[name], label=name)
+        axs[1].semilogy(steps, [float(r['validation_l2']) for r in rows],
+                        color=COLORS[name], label=name)
+    for ax in axs:
+        ax.set_xlabel('Training step'); ax.grid(alpha=.2); ax.legend(fontsize=8)
+    axs[0].set_ylabel('PDE mean squared residual')
+    axs[1].set_ylabel('Validation relative L2 error')
+    fig.tight_layout(); fig.savefig(outdir / 'training_curves.png', dpi=200); plt.close(fig)
+    fig, axs = plt.subplots(2, 3, figsize=(12, 7.7), sharex=True, sharey=True)
+    for ax, name in zip(axs.ravel(), names):
+        z = np.abs(grids[name] - true)
+        im = ax.pcolormesh(X, Y, z, shading='auto', cmap='viridis', vmin=0, vmax=shared_max)
+        ax.set_title(name); ax.set_xlabel('x'); ax.set_ylabel('y')
+    fig.subplots_adjust(right=.88, wspace=.25, hspace=.35)
+    fig.colorbar(im, cax=fig.add_axes([.91, .15, .018, .7]), label='Absolute error')
+    fig.savefig(outdir / 'error_maps_comparison.png', dpi=200); plt.close(fig)
+
+
+def run(cfg, names, outdir, plots=True):
+    outdir=Path(outdir);outdir.mkdir(parents=True,exist_ok=True)
+    global NUMPY_DTYPE
+    NUMPY_DTYPE=np.float64 if cfg.get('precision','float32')=='float64' else np.float32
+    tf.keras.backend.clear_session()
+    dde.config.set_default_float(cfg.get('precision','float32'))
+    dde.config.set_random_seed(cfg['seed'])
+    tf.config.experimental.enable_op_determinism()
+    geom=dde.geometry.Rectangle([-1,-1],[1,1])
+    data=dde.data.PDE(geom,PINNpde,[],num_domain=cfg['num_domain'],
+                      train_distribution='uniform',solution=sol,num_test=10000)
+    validation=(2*np.random.default_rng(47321).random((4096,2))-1).astype(NUMPY_DTYPE)
+    residual_points=(2*np.random.default_rng(65401).random((3000,2))-1).astype(NUMPY_DTYPE)
+    initial_precision=cfg.get('initialization_precision','same')
+    if initial_precision!='same':
+        dde.config.set_default_float(initial_precision)
+    initial_net=make_net(cfg)
+    initial_weights=[w.astype(NUMPY_DTYPE) for w in initial_net.get_weights()]
+    dde.config.set_default_float(cfg.get('precision','float32'))
+    if cfg.get('head_initialization','glorot')=='constant':
+        initial_weights[-2]=np.zeros_like(initial_weights[-2])
+        initial_weights[-1]=np.full_like(initial_weights[-1],cfg.get('output_bias',0.0))
+    if cfg.get('initial_weights'):
+        with np.load(cfg['initial_weights']) as saved:
+            initial_weights=[saved[f'w{i}'].astype(NUMPY_DTYPE) for i in range(len(initial_weights))]
+    initial_hash=hashlib.sha256(b''.join(w.tobytes() for w in initial_weights)).hexdigest()
+    np.savez_compressed(outdir/'initial_weights.npz',**{f'w{i}':w for i,w in enumerate(initial_weights)})
+    np.savez_compressed(outdir/'evaluation_points.npz',validation=validation,
+                        residual=residual_points,train=data.train_x)
+    config=dict(cfg,optimizers=names,initial_weights_sha256=initial_hash,
+                actual_training_points=len(data.train_x),
+                architecture=[2]+[cfg.get('width',20)]*cfg.get('depth',3)+[1],
+                shared_features=cfg.get('features','original'),
+                equation='u_xx + u_yy + u = (1-5*pi^2)*sin(pi*x)*sin(2*pi*y)',
+                domain=[[-1,-1],[1,1]],slice_y=0.25,
+                CDAdam_gradient_source='automatic differentiation; attachment update retained',
+                NFAdamW_direction='attachment tf.roll gradient stencil along tensor axis 0',
+                selection_metric='4096 fixed validation points: relative L2 error',
+                final_ranking_metric='128 x 128 full-domain grid: relative L2 error',
+                versions={'python':platform.python_version(),'tensorflow':tf.__version__,
+                          'deepxde':dde.__version__,'numpy':np.__version__,'platform':platform.platform()})
+    (outdir/'config.json').write_text(json.dumps(config,indent=2),encoding='utf-8')
+    results=[]
+    for name in names:
+        optimizer_start=time.perf_counter()
+        print(f'\n===== {name}; same initial weights {initial_hash[:12]} =====',flush=True)
+        net_i=make_net(cfg);net_i.set_weights(initial_weights)
+        assert hashlib.sha256(b''.join(w.tobytes() for w in net_i.get_weights())).hexdigest()==initial_hash
+        model_i=dde.Model(data,net_i)
+        optimizer=make_optimizer(name,cfg)
+        compile_start=time.perf_counter()
+        model_i.compile(optimizer,metrics=['l2 relative error'])
+        compile_seconds=time.perf_counter()-compile_start
+        cb=History(validation,cfg['record_every'],name,outdir,optimizer_ref=optimizer)
+        lr_callback=SharedLearningRate(optimizer,cfg)
+        start=time.perf_counter()
+        model_i.train(iterations=cfg['steps'],display_every=cfg['record_every'],
+                      callbacks=[lr_callback,cb])
+        assert int(model_i.train_state.step)==cfg['steps']
+        seconds=time.perf_counter()-start
+        evaluation_start=time.perf_counter()
+        row=evaluate(name,model_i,validation,residual_points,seconds,outdir)
+        row['compile_seconds']=compile_seconds
+        row['evaluation_seconds']=time.perf_counter()-evaluation_start
+        row['total_seconds']=time.perf_counter()-optimizer_start
+        results.append(row)
+        with (outdir/'optimizer_comparison.csv').open('w',newline='',encoding='utf-8') as f:
+            w=csv.DictWriter(f,fieldnames=list(row));w.writeheader();w.writerows(results)
+        (outdir/'results.json').write_text(json.dumps(results,indent=2),encoding='utf-8')
+        print('MEASURED_RESULT '+json.dumps(row),flush=True)
+    print('\nFinal-iterate ranking by 128 x 128 full-domain relative L2 (lower is better):')
+    for idx,r in enumerate(sorted(results,key=lambda r:r['L2_relative_error']),1):
+        print(f"{idx}. {r['optimizer']:8} L2={r['L2_relative_error']:.9e}, MAE={r['MAE']:.9e}")
+    write_tables(results,outdir)
+    if plots:
+        make_figures(outdir,names)
+    (outdir/'run_complete.json').write_text(json.dumps({
+        'complete':True,'steps_per_optimizer':cfg['steps'],'optimizers':names,
+        'record_count':len(results),'timing':'sequential model.train wall time; seconds',
+        'derivative_definition':'du=(u_x,u_y); relative L2 of concatenated derivatives',
+    },indent=2),encoding='utf-8')
+    return results
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--steps',type=int,default=FINAL_EPOCHS)
+    p.add_argument('--lr',type=float,default=lr_nfgl)
+    p.add_argument('--beta1',type=float,default=COMMON_BETA1)
+    p.add_argument('--cd-beta1',type=float,default=CD_BETA1)
+    p.add_argument('--beta2',type=float,default=.999)
+    p.add_argument('--nf-beta2',type=float,default=0.995,help='optional NFAdamW beta2 override; recorded explicitly')
+    p.add_argument('--cd-beta2',type=float,default=0.995,help='optional CDAdam beta2 override; recorded explicitly')
+    p.add_argument('--epsilon',type=float,default=1e-8)
+    p.add_argument('--alpha',type=float,default=ordered)
+    p.add_argument('--h',type=float,default=h)
+    p.add_argument('--weight-decay',type=float,default=weight_decay)
+    p.add_argument('--seed',type=int,default=2026)
+    p.add_argument('--num-domain',type=int,default=5000)
+    p.add_argument('--record-every',type=int,default=1000)
+    p.add_argument('--schedule',choices=['constant','piecewise','cosine','cosine_tail'],default='cosine_tail')
+    p.add_argument('--precision',choices=['float32','float64'],default='float64')
+    p.add_argument('--initial-weights',default=None)
+    p.add_argument('--width',type=int,default=20)
+    p.add_argument('--depth',type=int,default=3)
+    p.add_argument('--head-initialization',choices=['glorot','constant'],default='constant')
+    p.add_argument('--output-bias',type=float,default=0.0)
+    p.add_argument('--output-scale',type=float,default=16.0)
+    p.add_argument('--features',choices=['original','parity'],default='parity')
+    p.add_argument('--initialization-precision',choices=['same','float32'],default='float32')
+    p.add_argument('--decay-fraction',type=float,default=0.75)
+    p.add_argument('--lr-floor',type=float,default=0.001,
+                   help='cosine final/initial learning rate ratio')
+    p.add_argument('--optimizers',nargs='+',choices=OPTIMIZERS,default=OPTIMIZERS)
+    p.add_argument('--output',default='hel_optimizer_comparison_10000')
+    p.add_argument('--no-plots',action='store_true')
+    p.add_argument('--plot-only',action='store_true',help='redraw saved raw predictions without training')
+    args=p.parse_args()
+    if args.plot_only:
+        out=Path(args.output)
+        saved=json.loads((out/'config.json').read_text(encoding='utf-8'))
+        global NUMPY_DTYPE
+        NUMPY_DTYPE=np.float64 if saved.get('precision')=='float64' else np.float32
+        make_figures(out,saved['optimizers'])
+        return
+    if args.steps<1 or args.record_every<1 or args.num_domain<1:
+        p.error('steps, record-every, and num-domain must be positive')
+    if args.width<1 or args.depth<1 or args.output_scale<=0:
+        p.error('width, depth and output-scale must be positive')
+    if not (0<args.decay_fraction<=1 and 0<=args.lr_floor<=1):
+        p.error('require 0 < decay-fraction <= 1 and 0 <= lr-floor <= 1')
+    if not (0<args.alpha<=1 and 0<args.h<=1):
+        p.error('require 0 < alpha <= 1 and 0 < h <= 1')
+    cfg={'steps':args.steps,'learning_rate':args.lr,'beta1':args.beta1,
+         'cd_beta1':args.cd_beta1,'beta2':args.beta2,
+         'nf_beta2':args.nf_beta2 if args.nf_beta2 is not None else args.beta2,
+         'cd_beta2':args.cd_beta2 if args.cd_beta2 is not None else args.beta2,
+         'epsilon':args.epsilon,
+         'alpha':args.alpha,'h':args.h,'weight_decay':args.weight_decay,
+         'seed':args.seed,'num_domain':args.num_domain,'record_every':args.record_every,
+         'schedule':args.schedule,'lr_floor':args.lr_floor,'decay_fraction':args.decay_fraction,
+         'precision':args.precision,'initial_weights':args.initial_weights,
+         'width':args.width,'depth':args.depth,'features':args.features,
+         'initialization_precision':args.initialization_precision,
+         'head_initialization':args.head_initialization,'output_bias':args.output_bias,'output_scale':args.output_scale}
+    run(cfg,args.optimizers,args.output,not args.no_plots)
+
+if __name__=='__main__':
+    main()
